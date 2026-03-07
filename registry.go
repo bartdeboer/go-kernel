@@ -51,6 +51,13 @@ func (r *Registry) SetSearchPath(root string) (*SearchMap, error) {
 	return sm, nil
 }
 
+func (r *Registry) SearchPath() string {
+	if r == nil || r.searchMap == nil {
+		return ""
+	}
+	return r.searchMap.root
+}
+
 // Convenience: configure the default registry's search path.
 func SetDefaultSearchPath(root string) (*SearchMap, error) {
 	return defaultRegistry.SetSearchPath(root)
