@@ -1,4 +1,4 @@
-package core_test
+package kernel_test
 
 import (
 	"context"
@@ -6,10 +6,14 @@ import (
 	"reflect"
 	"testing"
 
-	core "github.com/bartdeboer/go-core"
+	kernel "github.com/bartdeboer/go-kernel"
 )
 
-// ListerAdp implements core.Lister and is configurable via lister-adp.json.
+type Lister interface {
+	List(ctx context.Context) ([]string, error)
+}
+
+// ListerAdp implements the local Lister interface and is configurable via lister-adp.json.
 type ListerAdp struct {
 	Note    string `json:"note"`
 	WorkDir string
@@ -19,12 +23,12 @@ func (l *ListerAdp) List(ctx context.Context) ([]string, error) {
 	return []string{"one", "two"}, nil
 }
 
-// ConfigPtr makes ListerAdp implement core.Configurable so lister-adp.json is used.
+// ConfigPtr makes ListerAdp implement kernel.Configurable so lister-adp.json is used.
 func (l *ListerAdp) ConfigPtr() any {
 	return l
 }
 
-// SetContext makes ListerAdp implement core.WorkDirSetter.
+// SetWorkDir makes ListerAdp implement kernel.WorkDirSettable.
 func (l *ListerAdp) SetWorkDir(path string) {
 	l.WorkDir = path
 }
@@ -50,43 +54,43 @@ type Adp struct {
 
 	// Injected from dependencies in adp.json:
 	// "dependencies": { "ListerProvider": { "adapter": "lister-adp" } }
-	ListerProvider core.Lister `core:"required"`
-	ChildProvider  core.Lister `core:"required"` // has NO config/context; should inherit parent
+	ListerProvider Lister `core:"required"`
+	ChildProvider  Lister `core:"required"` // has NO config/context; should inherit parent
 }
 
-// ConfigPtr makes Adp implement core.Configurable.
+// ConfigPtr makes Adp implement kernel.Configurable.
 func (a *Adp) ConfigPtr() any {
 	return &a.Spec
 }
 
-// ItemConfigPtr makes Adp implement core.ItemConfigurable.
+// ItemConfigPtr makes Adp implement kernel.ItemConfigurable.
 // We deliberately return the same Spec pointer so item config overlays adapter config.
 func (a *Adp) ItemConfigPtr(name string) any {
 	return &a.Spec
 }
 
-// SetContext makes Adp implement core.Contextual.
+// SetWorkDir makes Adp implement kernel.WorkDirSettable.
 func (a *Adp) SetWorkDir(path string) {
 	a.WorkDir = path
 }
 
 func TestAdapter_ConfigOverride_DependencyInjection_AndContext(t *testing.T) {
 	// Use configs from ./testdata.
-	if _, err := core.SetDefaultSearchPath("testdata"); err != nil {
+	if _, err := kernel.SetDefaultSearchPath("testdata"); err != nil {
 		t.Fatalf("SearchMap: %v", err)
 	}
 
 	// Register adapters.
-	core.Register("lister-adp", func() core.Adapter { return &ListerAdp{} })
-	core.Register("child-adp", func() core.Adapter { return &ChildAdp{} })
-	core.Register("adp", func() core.Adapter { return &Adp{} })
+	kernel.Register("lister-adp", func() kernel.Adapter { return &ListerAdp{} })
+	kernel.Register("child-adp", func() kernel.Adapter { return &ChildAdp{} })
+	kernel.Register("adp", func() kernel.Adapter { return &Adp{} })
 
 	// Create an instance of "adp" using the item config "items/inst1".
 	// Uses:
 	//   - testdata/adp.json         (adapter-level config + context)
 	//   - testdata/items/inst1.json (item-level config + context)
 	//   - testdata/lister-adp.json  (dependency config + context)
-	adp, err := core.NewAdapterAs[*Adp]("adp", "items/inst1")
+	adp, err := kernel.NewAdapterAs[*Adp]("adp", "items/inst1")
 	if err != nil {
 		t.Fatalf("NewAdapterAs(adp): %v", err)
 	}
@@ -171,20 +175,20 @@ func TestAdapter_ConfigOverride_DependencyInjection_AndContext(t *testing.T) {
 }
 
 func TestAdapter_ContextAffectsDependencyReuse(t *testing.T) {
-	if _, err := core.SetDefaultSearchPath("testdata"); err != nil {
+	if _, err := kernel.SetDefaultSearchPath("testdata"); err != nil {
 		t.Fatalf("SearchMap: %v", err)
 	}
 
 	// Re-registering in a second test is fine in this package; keys are per-process.
-	core.Register("lister-adp", func() core.Adapter { return &ListerAdp{} })
-	core.Register("child-adp", func() core.Adapter { return &ChildAdp{} })
-	core.Register("adp", func() core.Adapter { return &Adp{} })
+	kernel.Register("lister-adp", func() kernel.Adapter { return &ListerAdp{} })
+	kernel.Register("child-adp", func() kernel.Adapter { return &ChildAdp{} })
+	kernel.Register("adp", func() kernel.Adapter { return &Adp{} })
 
-	a1, err := core.NewAdapterAs[*Adp]("adp", "items/inst1")
+	a1, err := kernel.NewAdapterAs[*Adp]("adp", "items/inst1")
 	if err != nil {
 		t.Fatalf("NewAdapterAs(inst1): %v", err)
 	}
-	a2, err := core.NewAdapterAs[*Adp]("adp", "items/inst2")
+	a2, err := kernel.NewAdapterAs[*Adp]("adp", "items/inst2")
 	if err != nil {
 		t.Fatalf("NewAdapterAs(inst2): %v", err)
 	}

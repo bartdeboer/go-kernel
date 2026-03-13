@@ -1,4 +1,4 @@
-module github.com/bartdeboer/go-core
+module github.com/bartdeboer/go-kernel
 
 go 1.24.0
 

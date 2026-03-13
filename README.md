@@ -1,4 +1,4 @@
-# go-core
+# go-kernel
 
 A polymorph adapter system
 

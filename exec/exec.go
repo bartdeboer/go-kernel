@@ -5,14 +5,14 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/bartdeboer/go-core"
+	"github.com/bartdeboer/go-kernel"
 )
 
 const AdapterID = "exec"
 
 // Ensure Executor implements both roles.
 var (
-	_ core.Executor   = (*Executor)(nil)
+	_ kernel.Executor = (*Executor)(nil)
 	_ CommandExecutor = (*Executor)(nil)
 )
 
@@ -22,7 +22,7 @@ type Executor struct{}
 
 // Register the adapter with the core registry.
 func init() {
-	core.Register(AdapterID, func() core.Adapter {
+	kernel.Register(AdapterID, func() kernel.Adapter {
 		return &Executor{}
 	})
 }

@@ -1,4 +1,4 @@
-package core
+package kernel
 
 import (
 	"context"
@@ -329,7 +329,7 @@ func Adapters() map[string]Adapter {
 // There should be no heavy lifting
 //
 //	func init() {
-//		core.Register("adapter-id", func() Adapter {
+//		kernel.Register("adapter-id", func() Adapter {
 //			return &GCloud{} // zero cost constructor
 //		})
 //	}
