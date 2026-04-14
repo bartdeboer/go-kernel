@@ -23,11 +23,10 @@ type Entry struct {
 }
 
 type Registry struct {
-	mu          sync.RWMutex
-	constructMu sync.Mutex
-	entries     map[string]*Entry
-	nodes       map[string]*Node
-	searchMap   *SearchMap
+	mu        sync.RWMutex
+	entries   map[string]*Entry
+	nodes     map[string]*Node
+	searchMap *SearchMap
 }
 
 func (r *Registry) SetSearchMap(sm *SearchMap) {
@@ -195,9 +194,6 @@ func debugAdapterInfo(instance Adapter, adapterID string, args ...string) {
 }
 
 func (r *Registry) Construct(adapterID string, args ...string) (*Node, error) {
-	r.constructMu.Lock()
-	defer r.constructMu.Unlock()
-
 	return r.constructWithWorkDir(adapterID, "", args...)
 }
 

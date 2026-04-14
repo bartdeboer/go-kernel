@@ -226,6 +226,19 @@ type KernelRequiredAdp struct {
 	Dep *B `kernel:"required"`
 }
 
+type ReentrantHydrater struct {
+	Loaded []*ListerAdp
+}
+
+func (r *ReentrantHydrater) Hydrate(ctx context.Context) error {
+	adapters, err := kernel.LoadAllAdapters[*ListerAdp]("lister-adp")
+	if err != nil {
+		return err
+	}
+	r.Loaded = adapters
+	return nil
+}
+
 func TestConstruct_CachesNodeBeforeDependencyAssignment(t *testing.T) {
 	if _, err := kernel.SetDefaultSearchPath("testdata/cycle"); err != nil {
 		t.Fatalf("SearchMap: %v", err)
@@ -254,6 +267,24 @@ func TestConstruct_CachesNodeBeforeDependencyAssignment(t *testing.T) {
 	}
 	if root.B.A != root {
 		t.Fatalf("expected cyclic dependency to reuse the same *A instance")
+	}
+}
+
+func TestConstruct_AllowsReentrantLoadAllDuringHydrate(t *testing.T) {
+	if _, err := kernel.SetDefaultSearchPath("testdata"); err != nil {
+		t.Fatalf("SearchMap: %v", err)
+	}
+
+	kernel.Register("lister-adp", func() kernel.Adapter { return &ListerAdp{} })
+	kernel.Register("reentrant-hydrater", func() kernel.Adapter { return &ReentrantHydrater{} })
+
+	root, err := kernel.NewAdapterAs[*ReentrantHydrater]("reentrant-hydrater")
+	if err != nil {
+		t.Fatalf("NewAdapterAs(reentrant-hydrater): %v", err)
+	}
+
+	if len(root.Loaded) == 0 {
+		t.Fatalf("expected hydrate to load lister adapters without deadlocking")
 	}
 }
 
