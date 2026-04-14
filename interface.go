@@ -23,10 +23,6 @@ type Executor interface {
 	Output(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
-type Depender interface {
-	AddDependency(name string, adapter Adapter)
-}
-
 type WorkDirSettable interface {
 	SetWorkDir(hostPath string)
 }

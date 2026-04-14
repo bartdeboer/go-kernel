@@ -5,18 +5,35 @@ import (
 	"reflect"
 	"strings"
 
-	"slices"
-
 	"github.com/bartdeboer/words"
 )
 
-// applyDeps wires dependencies into an adapter using both map-style (Depender) and
-// struct-field injection.
-func applyDeps(adapter Adapter, parentWorkDir string, meta *MetaHeader) error {
-	// infer from struct tags regardless of meta
-	inferred, err := findStructDeps(adapter)
+// applyDeps wires dependencies into a node's adapter instance and records the graph edges.
+func (r *Registry) applyDeps(node *Node, meta *MetaHeader) error {
+	if meta == nil {
+		return nil
+	}
+
+	deps, err := resolvedDeps(node.Instance, meta)
 	if err != nil {
 		return err
+	}
+	if len(deps) == 0 {
+		return nil
+	}
+
+	if err := r.resolveStructDeps(node, deps); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resolvedDeps combines explicit config deps with inferred struct deps.
+// Config wins over inferred.
+func resolvedDeps(adapter Adapter, meta *MetaHeader) (map[string]DepRef, error) {
+	inferred, err := findStructDeps(adapter)
+	if err != nil {
+		return nil, err
 	}
 
 	var cfg map[string]DepRef
@@ -24,67 +41,19 @@ func applyDeps(adapter Adapter, parentWorkDir string, meta *MetaHeader) error {
 		cfg = meta.Dependencies
 	}
 
-	deps := mergeDeps(cfg, inferred)
-	if deps == nil {
-		return nil
-	}
-
-	if depender, ok := adapter.(Depender); ok {
-		if err := resolveMapDeps(depender, parentWorkDir, deps); err != nil {
-			return err
-		}
-	}
-	if err := resolveStructDeps(adapter, parentWorkDir, deps); err != nil {
-		return err
-	}
-	return nil
-}
-
-func resolveMapDeps(target Depender, parentWorkDir string, deps map[string]DepRef) error {
-	for name, ref := range deps {
-		var alias string
-		switch {
-		case ref.Name != "":
-			alias = ref.Name
-		case ref.Adapter != "":
-			alias = ref.Adapter
-		}
-
-		// Check for existing that should be reused
-		if alias != "" {
-			depKey := strings.ToLower(ref.Adapter) + "__" + alias
-			// adapters map is now inside the registry, but resolveMapDeps is only
-			// called from NewAdapter after the registry has installed the adapter,
-			// so reuse is handled there. This function only constructs new deps.
-			_ = depKey
-		}
-
-		// Otherwise create a new instance
-		var depArgs []string
-		if ref.Name != "" {
-			depArgs = append(depArgs, ref.Name)
-		}
-		depArgs = append(depArgs, ref.Args...)
-
-		depAdapter, err := newAdapterWithContext(ref.Adapter, parentWorkDir, depArgs...)
-		if err != nil {
-			return fmt.Errorf("failed loading dependency %q: %w", name, err)
-		}
-		target.AddDependency(name, depAdapter)
-	}
-	return nil
+	return mergeDeps(cfg, inferred), nil
 }
 
 // resolveStructDeps initialises and assigns dependencies to exported
-// pointer fields on the parent whose names match deps' keys.
-func resolveStructDeps(target any, parentWorkDir string, deps map[string]DepRef) error {
-	v := reflect.ValueOf(target)
+// struct fields on the parent node's instance whose names match deps' keys.
+func (r *Registry) resolveStructDeps(parent *Node, deps map[string]DepRef) error {
+	v := reflect.ValueOf(parent.Instance)
 	if v.Kind() != reflect.Ptr {
-		return fmt.Errorf("resolveStructDeps: target must be a pointer, got %T", target)
+		return fmt.Errorf("resolveStructDeps: target must be a pointer, got %T", parent.Instance)
 	}
 	v = v.Elem()
 	if v.Kind() != reflect.Struct {
-		return fmt.Errorf("resolveStructDeps: target must point to a struct, got %T", target)
+		return fmt.Errorf("resolveStructDeps: target must point to a struct, got %T", parent.Instance)
 	}
 
 	for mapName, ref := range deps {
@@ -98,18 +67,17 @@ func resolveStructDeps(target any, parentWorkDir string, deps map[string]DepRef)
 			return fmt.Errorf("field %q is not settable", fieldName)
 		}
 
-		childArgs := slices.Clone(ref.Args)
+		childArgs := append([]string(nil), ref.Args...)
 		if ref.Name != "" {
 			childArgs = append([]string{ref.Name}, childArgs...)
 		}
 
-		// Pass the parent context path
-		dep, err := newAdapterWithContext(ref.Adapter, parentWorkDir, childArgs...)
+		child, err := r.constructWithContext(ref.Adapter, parent.ResolvedWorkDir, childArgs...)
 		if err != nil {
 			return fmt.Errorf("dependency %q: %w", fieldName, err)
 		}
 
-		depVal := reflect.ValueOf(dep)
+		depVal := reflect.ValueOf(child.Instance)
 		if !depVal.Type().AssignableTo(field.Type()) {
 			return fmt.Errorf("dependency %q (%s) not assignable to field %s (%s)",
 				fieldName, depVal.Type(), fieldName, field.Type())
@@ -119,6 +87,7 @@ func resolveStructDeps(target any, parentWorkDir string, deps map[string]DepRef)
 			depVal.Type(), fieldName, field.Type())
 
 		field.Set(depVal)
+		parent.Dependencies[fieldName] = child
 	}
 
 	return nil
@@ -175,7 +144,7 @@ func findStructDeps(target any) (map[string]DepRef, error) {
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 
-		// Only exported fields
+		// Only exported fields participate in dependency injection.
 		if sf.PkgPath != "" {
 			continue
 		}
@@ -191,10 +160,10 @@ func findStructDeps(target any) (map[string]DepRef, error) {
 
 		switch {
 		case len(parts) >= 2:
-			// Positional form: first token is the adapter key (even if it's "required").
+			// Positional form: first token is the adapter key (even if a later token is "required").
 			adapterID = strings.TrimSpace(parts[0])
 		default:
-			// Single token form: either a flag (required) or a key.
+			// Single token form: either a flag (required) or an adapter key.
 			p := strings.TrimSpace(parts[0])
 			if !strings.EqualFold(p, "required") {
 				adapterID = p
@@ -217,11 +186,11 @@ func mergeDeps(config map[string]DepRef, inferred map[string]DepRef) map[string]
 	}
 	out := make(map[string]DepRef)
 
-	// config first (wins)
+	// Config wins over inferred dependencies.
 	for k, v := range config {
 		out[k] = v
 	}
-	// fill missing from inferred
+	// Fill in any gaps from inferred struct tags.
 	for k, v := range inferred {
 		if _, exists := out[k]; !exists {
 			out[k] = v

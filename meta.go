@@ -35,6 +35,8 @@ type MetaHeader struct {
 	Dependencies map[string]DepRef `json:"dependencies"`
 	RawSpec      json.RawMessage   `json:"spec"`     // adapter-specific payload
 	WorkDir      string            `json:"work_dir"` // project path (rel or abs)
+	SourcePath   string            `json:"-"`
+	SourceName   string            `json:"-"`
 }
 
 type SearchMap struct {
@@ -140,6 +142,14 @@ func (sm *SearchMap) Load(name string, verbose bool) (*MetaHeader, error) {
 
 	if strings.TrimSpace(h.Name) == "" {
 		h.Name = strings.TrimSuffix(filepath.Base(cfgPath), ".json")
+	}
+	h.SourcePath = cfgPath
+	h.SourceName = cfgPath
+
+	if absRoot, err := filepath.Abs(sm.root); err == nil {
+		if relPath, err := filepath.Rel(absRoot, cfgPath); err == nil && !strings.HasPrefix(relPath, "..") {
+			h.SourceName = filepath.ToSlash(relPath)
+		}
 	}
 
 	// Override from env/contextMap if present

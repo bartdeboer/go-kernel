@@ -17,16 +17,44 @@ type Adapter any
 // ZeroFactory should construct a zero-cost, zero-valued adapter.
 type ZeroFactory func() Adapter
 
+type Entry struct {
+	ID            string
+	ConstructZero ZeroFactory
+}
+
+type Node struct {
+	Key             string
+	AdapterID       string
+	ItemName        string
+	ResolvedWorkDir string
+
+	AdapterMeta *MetaHeader
+	ItemMeta    *MetaHeader
+
+	Dependencies map[string]*Node
+	Instance     Adapter
+	Reused       bool
+}
+
+func (n *Node) Get(name string) (*Node, bool) {
+	if n == nil || n.Dependencies == nil {
+		return nil, false
+	}
+	child, ok := n.Dependencies[name]
+	return child, ok
+}
+
 type Registry struct {
-	mu        sync.RWMutex
-	factories map[string]ZeroFactory
-	adapters  map[string]Adapter
-	searchMap *SearchMap
+	mu          sync.RWMutex
+	constructMu sync.Mutex
+	entries     map[string]*Entry
+	nodes       map[string]*Node
+	searchMap   *SearchMap
 }
 
 var defaultRegistry = &Registry{
-	factories: make(map[string]ZeroFactory),
-	adapters:  make(map[string]Adapter),
+	entries: make(map[string]*Entry),
+	nodes:   make(map[string]*Node),
 }
 
 // DefaultRegistry returns the package-global registry used by the helper funcs.
@@ -68,47 +96,52 @@ func SetDefaultSearchMap(sm *SearchMap) {
 	defaultRegistry.SetSearchMap(sm)
 }
 
-// Register adds an Adapter constructor to the registry.
+// Register adds an adapter entry to the registry.
 func (r *Registry) Register(adapterID string, f ZeroFactory) {
+	id := strings.ToLower(adapterID)
+
 	r.mu.Lock()
-	r.factories[strings.ToLower(adapterID)] = f
+	r.entries[id] = &Entry{
+		ID:            adapterID,
+		ConstructZero: f,
+	}
 	r.mu.Unlock()
 }
 
 // IsRegistered reports whether an adapterID has a registered factory.
 func (r *Registry) IsRegistered(adapterID string) bool {
 	r.mu.RLock()
-	_, ok := r.factories[strings.ToLower(adapterID)]
+	_, ok := r.entries[strings.ToLower(adapterID)]
 	r.mu.RUnlock()
 	return ok
 }
 
-func (r *Registry) getFactory(adapterID string) (ZeroFactory, error) {
+func (r *Registry) getEntry(adapterID string) (*Entry, error) {
 	r.mu.RLock()
-	zeroFac, ok := r.factories[strings.ToLower(adapterID)]
+	entry, ok := r.entries[strings.ToLower(adapterID)]
 	r.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("unknown adapter %q", adapterID)
 	}
-	return zeroFac, nil
+	return entry, nil
 }
 
-func keyGen(adapter Adapter, adapterID string, item *MetaHeader, contextPath string) string {
+func keyGen(adapter Adapter, adapterID string, item *MetaHeader, workDir string) string {
 	key := strings.ToLower(adapterID)
 
 	if item != nil && item.Name != "" {
 		key += "__" + item.Name
 	}
 
-	// Only context-discriminate if the adapter cares about context.
-	if _, ok := adapter.(WorkDirSettable); !ok || contextPath == "" {
+	// Only workdir-discriminate if the adapter actually cares about workdir.
+	if _, ok := adapter.(WorkDirSettable); !ok || workDir == "" {
 		return key
 	}
 
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(key))
 	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(contextPath))
+	_, _ = h.Write([]byte(workDir))
 
 	return fmt.Sprintf("%s__%016x", key, h.Sum64())
 }
@@ -123,6 +156,7 @@ func applyConfig(adapter Adapter, adapterID string, meta, itemMeta *MetaHeader) 
 			}
 		}
 	}
+
 	// Item-level config overlay.
 	if itemMeta != nil && len(itemMeta.RawSpec) > 0 {
 		if itemConfigurable, ok := adapter.(ItemConfigurable); ok {
@@ -132,18 +166,19 @@ func applyConfig(adapter Adapter, adapterID string, meta, itemMeta *MetaHeader) 
 			}
 		}
 	}
+
 	return nil
 }
 
 func resolveWorkDir(defaultWorkDir string, metas ...*MetaHeader) string {
-	newWorkDir := defaultWorkDir
+	workDir := defaultWorkDir
 	for _, m := range metas {
 		if m == nil || m.WorkDir == "" {
 			continue
 		}
-		newWorkDir = m.WorkDir
+		workDir = m.WorkDir
 	}
-	return newWorkDir
+	return workDir
 }
 
 func debugAdapterInfo(zero Adapter, adapterID string, args ...string) {
@@ -160,29 +195,30 @@ func debugAdapterInfo(zero Adapter, adapterID string, args ...string) {
 	if _, ok := zero.(WorkDirSettable); ok {
 		implements = append(implements, "WorkDirSettable")
 	}
-	if _, ok := zero.(Depender); ok {
-		implements = append(implements, "Depender")
-	}
 	Log().Debugf("request adapter %s (%s) %v\n", adapterID, strings.Join(implements, ","), args)
 }
 
-func (r *Registry) NewAdapter(adapterID string, args ...string) (Adapter, error) {
-	return r.newAdapterWithContext(adapterID, "", args...)
+func (r *Registry) Construct(adapterID string, args ...string) (*Node, error) {
+	// Construction is not a hot path for this kernel. A coarse lock keeps the
+	// cache semantics easy to read: one top-level construct at a time, fully
+	// build the node, then publish it into the cache on success.
+	r.constructMu.Lock()
+	defer r.constructMu.Unlock()
+
+	return r.constructWithContext(adapterID, "", args...)
 }
 
-// NewAdapter constructs or reuses an adapter instance in this registry.
-func (r *Registry) newAdapterWithContext(adapterID string, defaultWorkDir string, args ...string) (Adapter, error) {
+func (r *Registry) constructWithContext(adapterID string, defaultWorkDir string, args ...string) (*Node, error) {
 	if r.searchMap == nil {
 		return nil, fmt.Errorf("core: no SearchMap configured; call NewSearchMap first")
 	}
 
-	zeroFac, err := r.getFactory(adapterID)
+	entry, err := r.getEntry(adapterID)
 	if err != nil {
 		return nil, err
 	}
 
-	zero := zeroFac()
-
+	zero := entry.ConstructZero()
 	debugAdapterInfo(zero, adapterID, args...)
 
 	var meta *MetaHeader
@@ -191,72 +227,79 @@ func (r *Registry) newAdapterWithContext(adapterID string, defaultWorkDir string
 	// Adapter-level config (optional).
 	meta, err = r.searchMap.Load(adapterID, true)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("failed reading config for adapter %s: %v", adapterID, err)
+		return nil, fmt.Errorf("failed reading config for adapter %s: %w", adapterID, err)
 	}
 
-	// Item-level config (optional, if adapter supports it and config arg provided).
-	if _, isItemConfigurable := zero.(ItemConfigurable); isItemConfigurable && len(args) > 0 {
-		configPath := args[0]
-		itemMeta, err = r.searchMap.Load(configPath, true)
+	// Item-level config (optional, if adapter supports it and a config arg is provided).
+	if _, ok := zero.(ItemConfigurable); ok && len(args) > 0 {
+		itemMeta, err = r.searchMap.Load(args[0], true)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("failed reading item config: %s for adapter %s: %v", configPath, adapterID, err)
+			return nil, fmt.Errorf("failed reading item config: %s for adapter %s: %w", args[0], adapterID, err)
 		}
 	}
 
 	resolvedWorkDir := resolveWorkDir(defaultWorkDir, meta, itemMeta)
-
 	regKey := keyGen(zero, adapterID, itemMeta, resolvedWorkDir)
 
-	// Reuse existing adapter if present.
+	// Reuse an already-constructed node if present.
 	r.mu.RLock()
-	existing, ok := r.adapters[regKey]
+	existing, ok := r.nodes[regKey]
 	r.mu.RUnlock()
 	if ok {
+		existing.Reused = true
 		Log().Debugf("reusing adapter: %s %v\n", adapterID, args)
 		return existing, nil
 	}
 
-	// Otherwise create a new instance.
-	Log().Debugf("creating adapter: %s %s %v\n", adapterID, regKey, args)
-	adapter := zero
+	node := &Node{
+		Key:             regKey,
+		AdapterID:       adapterID,
+		ResolvedWorkDir: resolvedWorkDir,
+		AdapterMeta:     meta,
+		ItemMeta:        itemMeta,
+		Dependencies:    make(map[string]*Node),
+		Instance:        zero,
+	}
+	if itemMeta != nil {
+		node.ItemName = itemMeta.Name
+	}
+
+	Log().Debugf("creating adapter node: %s %s %v\n", adapterID, regKey, args)
 
 	r.mu.Lock()
-	r.adapters[regKey] = adapter
+	r.nodes[node.Key] = node
 	r.mu.Unlock()
 
-	// Configs
-	if err := applyConfig(adapter, adapterID, meta, itemMeta); err != nil {
+	if err := applyConfig(node.Instance, adapterID, meta, itemMeta); err != nil {
 		return nil, err
 	}
 
-	// Set the working directory (allowing dependency override logic).
-	if wdSetter, ok := adapter.(WorkDirSettable); ok && resolvedWorkDir != "" {
+	if wdSetter, ok := node.Instance.(WorkDirSettable); ok && resolvedWorkDir != "" {
 		Log().Debugf("setting working directory for adapter %s: %s\n", adapterID, resolvedWorkDir)
 		wdSetter.SetWorkDir(resolvedWorkDir)
 	}
 
 	// Dependencies.
-	if err := applyDeps(adapter, resolvedWorkDir, meta); err != nil {
+	if err := r.applyDeps(node, meta); err != nil {
 		return nil, fmt.Errorf("dependency resolution for %s: %w", adapterID, err)
 	}
-	if err := applyDeps(adapter, resolvedWorkDir, itemMeta); err != nil {
+	if err := r.applyDeps(node, itemMeta); err != nil {
 		return nil, fmt.Errorf("dependency resolution for %s: %w", adapterID, err)
 	}
 
-	// Required dependency validation.
-	if err := validateRequiredDeps(adapter); err != nil {
+	if err := validateRequiredDeps(node.Instance); err != nil {
 		return nil, fmt.Errorf("validating adapter %s: %w", adapterID, err)
 	}
 
 	// Hydration hook.
-	if hydrater, ok := adapter.(Hydrater); ok {
+	if hydrater, ok := node.Instance.(Hydrater); ok {
 		Log().Debugf("hydrating adapter: %s\n", adapterID)
 		if err := hydrater.Hydrate(context.Background()); err != nil {
-			return nil, fmt.Errorf("hydrating adapter %s: %v", adapterID, err)
+			return nil, fmt.Errorf("hydrating adapter %s: %w", adapterID, err)
 		}
 	}
 
-	return adapter, nil
+	return node, nil
 }
 
 // loadAllMetas is a small helper to retrieve all MetaHeaders for an adapter ID.
@@ -267,24 +310,44 @@ func (r *Registry) loadAllMetas(adapterID string) ([]*MetaHeader, error) {
 	return r.searchMap.LoadAll(adapterID)
 }
 
-// --- Generic helpers (functions, not methods) ---
+// Register adds an Adapter constructor to the global registry.
+func Register(adapterID string, f ZeroFactory) {
+	defaultRegistry.Register(adapterID, f)
+}
+
+func IsRegistered(adapterID string) bool {
+	return defaultRegistry.IsRegistered(adapterID)
+}
+
+func Construct(adapterID string, args ...string) (*Node, error) {
+	return defaultRegistry.Construct(adapterID, args...)
+}
+
+func NewAdapter(adapterID string, args ...string) (Adapter, error) {
+	root, err := defaultRegistry.Construct(adapterID, args...)
+	if err != nil {
+		return nil, err
+	}
+	return root.Instance, nil
+}
 
 // NewAdapterAsFrom constructs an adapter from the given registry and asserts it implements T.
 func NewAdapterAsFrom[T any](r *Registry, adapterID string, args ...string) (T, error) {
 	var zeroT T
 
-	a, err := r.NewAdapter(adapterID, args...)
+	root, err := r.Construct(adapterID, args...)
 	if err != nil {
 		return zeroT, err
 	}
-	t, ok := a.(T)
+
+	t, ok := root.Instance.(T)
 	if ok {
 		return t, nil
 	}
 
 	return zeroT, fmt.Errorf(
 		"adapter %q does not implement requested type: expected %T, got %T",
-		adapterID, zeroT, a,
+		adapterID, zeroT, root.Instance,
 	)
 }
 
@@ -298,71 +361,36 @@ func LoadAllAdaptersFrom[T any](r *Registry, adapterID string) ([]T, error) {
 
 	var out []T
 	for _, meta := range metas {
-		a, err := NewAdapterAsFrom[T](r, adapterID, meta.Name)
+		t, err := NewAdapterAsFrom[T](r, adapterID, meta.Name)
 		if err != nil {
 			Log().Errorf("error: %v\n", err)
 			continue
 		}
-		out = append(out, a)
+		out = append(out, t)
 	}
 	return out, nil
 }
 
-// Adapters returns a shallow copy of the cached adapters of the default registry.
-// (Mostly for debugging / introspection.)
 func Adapters() map[string]Adapter {
 	defaultRegistry.mu.RLock()
 	defer defaultRegistry.mu.RUnlock()
 
-	cp := make(map[string]Adapter, len(defaultRegistry.adapters))
-	for k, v := range defaultRegistry.adapters {
-		cp[k] = v
+	cp := make(map[string]Adapter, len(defaultRegistry.nodes))
+	for k, n := range defaultRegistry.nodes {
+		cp[k] = n.Instance
 	}
 	return cp
 }
 
-// --- Package-level helpers using the default registry ---
+func Nodes() map[string]*Node {
+	defaultRegistry.mu.RLock()
+	defer defaultRegistry.mu.RUnlock()
 
-// Register adds an Adapter constructor to the global registry.
-//
-// fn MUST return a Adapter that is fully zero-initialised.
-// There should be no heavy lifting
-//
-//	func init() {
-//		kernel.Register("adapter-id", func() Adapter {
-//			return &GCloud{} // zero cost constructor
-//		})
-//	}
-//
-// Later the framework will do:
-//
-//	a := registry["adapter-id"]()   // clone via factory
-//
-//	if c, ok := a.(Configurable); ok {
-//		cfg := c.ConfigPtr()     // returns pointer to struct
-//		loadJSON(cfg)            // unmarshal adapter-level config
-//	}
-//
-//	if ic, ok := a.(ItemConfigurable); ok {
-//		itemCfg := ic.ItemConfigPtr() // pointer to per-item struct
-//		loadItemJSON(itemID, itemCfg) // unmarshals one item
-//	}
-//
-// and run the adapter
-func Register(adapterID string, f ZeroFactory) {
-	defaultRegistry.Register(adapterID, f)
-}
-
-func IsRegistered(adapterID string) bool {
-	return defaultRegistry.IsRegistered(adapterID)
-}
-
-func NewAdapter(adapterID string, args ...string) (Adapter, error) {
-	return defaultRegistry.NewAdapter(adapterID, args...)
-}
-
-func newAdapterWithContext(adapterID string, defaultContext string, args ...string) (Adapter, error) {
-	return defaultRegistry.newAdapterWithContext(adapterID, defaultContext, args...)
+	cp := make(map[string]*Node, len(defaultRegistry.nodes))
+	for k, v := range defaultRegistry.nodes {
+		cp[k] = v
+	}
+	return cp
 }
 
 // NewAdapterAs constructs an adapter from the default registry and asserts it implements T.
