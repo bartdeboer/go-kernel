@@ -24,7 +24,7 @@ func renderNode(b *strings.Builder, n *Node, prefix string, last bool, seen map[
 	}
 
 	label := n.AdapterID
-	if attrs := attributesForNode(n); attrs != "" {
+	if attrs := n.Attributes(); attrs != "" {
 		label += " <" + attrs + ">"
 	}
 	if n.Reused {
@@ -75,32 +75,4 @@ func renderNode(b *strings.Builder, n *Node, prefix string, last bool, seen map[
 
 		renderNode(b, child, childPrefix, true, seen)
 	}
-}
-
-func attributesForNode(n *Node) string {
-	if n == nil {
-		return ""
-	}
-
-	parts := []string{}
-
-	if n.ItemName != "" {
-		parts = append(parts, "name="+n.ItemName)
-	}
-
-	if n.ItemMeta != nil && n.ItemMeta.SourceName != "" {
-		parts = append(parts, "cfg="+n.ItemMeta.SourceName)
-	}
-
-	if n.AdapterMeta != nil && n.AdapterMeta.SourceName != "" {
-		if n.ItemMeta == nil || n.AdapterMeta.SourceName != n.ItemMeta.SourceName {
-			parts = append(parts, "cfg="+n.AdapterMeta.SourceName)
-		}
-	}
-
-	if n.ResolvedWorkDir != "" {
-		parts = append(parts, "context="+n.ResolvedWorkDir)
-	}
-
-	return strings.Join(parts, ", ")
 }

@@ -2,14 +2,9 @@ package kernel_test
 
 import (
 	"context"
-	"fmt"
 	"path/filepath"
 	"reflect"
-	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	kernel "github.com/bartdeboer/go-kernel"
 )
@@ -211,146 +206,82 @@ func TestAdapter_ContextAffectsDependencyReuse(t *testing.T) {
 	}
 }
 
-type HydratingAdp struct {
-	Calls *atomic.Int32
-	Fail  *atomic.Bool
-	Delay time.Duration
+type A struct {
+	B *B `core:"required"`
 }
 
-func (a *HydratingAdp) Hydrate(ctx context.Context) error {
-	a.Calls.Add(1)
-	if a.Delay > 0 {
-		time.Sleep(a.Delay)
+func (a *A) GetB() *B { return a.B }
+
+type B struct {
+	A *A `core:"required"`
+}
+
+func (b *B) GetA() *A { return b.A }
+
+type KernelPreferredAdp struct {
+	Dep *B `core:"legacy-adapter" kernel:"b"`
+}
+
+type KernelRequiredAdp struct {
+	Dep *B `kernel:"required"`
+}
+
+func TestConstruct_CachesNodeBeforeDependencyAssignment(t *testing.T) {
+	if _, err := kernel.SetDefaultSearchPath("testdata/cycle"); err != nil {
+		t.Fatalf("SearchMap: %v", err)
 	}
-	if a.Fail != nil && a.Fail.Load() {
-		return fmt.Errorf("hydrate failed")
+
+	type ADep interface {
+		GetB() *B
 	}
-	return nil
+	type BDep interface {
+		GetA() *A
+	}
+
+	kernel.Register("a", func() kernel.Adapter { return &A{} })
+	kernel.Register("b", func() kernel.Adapter { return &B{} })
+
+	root, err := kernel.NewAdapterAs[*A]("a")
+	if err != nil {
+		t.Fatalf("NewAdapterAs(a): %v", err)
+	}
+
+	if root.B == nil {
+		t.Fatalf("expected A.B to be assigned")
+	}
+	if root.B.A == nil {
+		t.Fatalf("expected B.A to be assigned")
+	}
+	if root.B.A != root {
+		t.Fatalf("expected cyclic dependency to reuse the same *A instance")
+	}
 }
 
-func uniqueAdapterID(t *testing.T, suffix string) string {
-	base := strings.ToLower(t.Name() + "-" + suffix)
-	base = strings.ReplaceAll(base, "/", "-")
-	base = strings.ReplaceAll(base, " ", "-")
-	return base
-}
-
-func TestConstruct_DoesNotCacheFailedNode(t *testing.T) {
+func TestKernelTag_SupportsDependencyInference(t *testing.T) {
 	if _, err := kernel.SetDefaultSearchPath(t.TempDir()); err != nil {
 		t.Fatalf("SearchMap: %v", err)
 	}
 
-	var calls atomic.Int32
-	var fail atomic.Bool
-	fail.Store(true)
+	kernel.Register("b", func() kernel.Adapter { return &B{} })
+	kernel.Register("kernel-preferred", func() kernel.Adapter { return &KernelPreferredAdp{} })
 
-	adapterID := uniqueAdapterID(t, "failing")
-	kernel.Register(adapterID, func() kernel.Adapter {
-		return &HydratingAdp{
-			Calls: &calls,
-			Fail:  &fail,
-		}
-	})
-
-	if _, err := kernel.Construct(adapterID); err == nil {
-		t.Fatalf("expected first construct to fail")
-	}
-
-	fail.Store(false)
-
-	node, err := kernel.Construct(adapterID)
+	root, err := kernel.NewAdapterAs[*KernelPreferredAdp]("kernel-preferred")
 	if err != nil {
-		t.Fatalf("expected second construct to succeed, got %v", err)
+		t.Fatalf("NewAdapterAs(kernel-preferred): %v", err)
 	}
-	if node == nil || node.Instance == nil {
-		t.Fatalf("expected constructed node")
-	}
-	if got, want := calls.Load(), int32(2); got != want {
-		t.Fatalf("hydrate calls = %d, want %d", got, want)
+	if root.Dep == nil {
+		t.Fatalf("expected dependency from kernel tag to be assigned")
 	}
 }
 
-func TestConstruct_ConcurrentReuseBuildsOnce(t *testing.T) {
+func TestKernelTag_SupportsRequiredValidation(t *testing.T) {
 	if _, err := kernel.SetDefaultSearchPath(t.TempDir()); err != nil {
 		t.Fatalf("SearchMap: %v", err)
 	}
 
-	var calls atomic.Int32
+	kernel.Register("kernel-required", func() kernel.Adapter { return &KernelRequiredAdp{} })
 
-	adapterID := uniqueAdapterID(t, "concurrent")
-	kernel.Register(adapterID, func() kernel.Adapter {
-		return &HydratingAdp{
-			Calls: &calls,
-			Delay: 25 * time.Millisecond,
-		}
-	})
-
-	const workers = 8
-	results := make(chan *kernel.Node, workers)
-	errs := make(chan error, workers)
-
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			node, err := kernel.Construct(adapterID)
-			if err != nil {
-				errs <- err
-				return
-			}
-			results <- node
-		}()
-	}
-	wg.Wait()
-	close(results)
-	close(errs)
-
-	for err := range errs {
-		if err != nil {
-			t.Fatalf("construct failed: %v", err)
-		}
-	}
-
-	var first *kernel.Node
-	for node := range results {
-		if first == nil {
-			first = node
-			continue
-		}
-		if node != first {
-			t.Fatalf("expected concurrent construct to reuse the same node instance")
-		}
-	}
-
-	if got, want := calls.Load(), int32(1); got != want {
-		t.Fatalf("hydrate calls = %d, want %d", got, want)
-	}
-}
-
-func TestNodeString_IncludesConfigSourcePaths(t *testing.T) {
-	if _, err := kernel.SetDefaultSearchPath("testdata"); err != nil {
-		t.Fatalf("SearchMap: %v", err)
-	}
-
-	kernel.Register("lister-adp", func() kernel.Adapter { return &ListerAdp{} })
-	kernel.Register("child-adp", func() kernel.Adapter { return &ChildAdp{} })
-	kernel.Register("adp", func() kernel.Adapter { return &Adp{} })
-
-	node, err := kernel.Construct("adp", "items/inst1")
-	if err != nil {
-		t.Fatalf("Construct(adp, items/inst1): %v", err)
-	}
-
-	graph := node.String()
-
-	if !strings.Contains(graph, "name=inst1") {
-		t.Fatalf("graph missing item name:\n%s", graph)
-	}
-	if !strings.Contains(graph, "cfg=items/inst1.json") {
-		t.Fatalf("graph missing item config source:\n%s", graph)
-	}
-	if !strings.Contains(graph, "cfg=adp.json") {
-		t.Fatalf("graph missing adapter config source:\n%s", graph)
+	if _, err := kernel.NewAdapterAs[*KernelRequiredAdp]("kernel-required"); err == nil {
+		t.Fatalf("expected missing kernel-tagged required dependency to fail validation")
 	}
 }

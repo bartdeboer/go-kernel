@@ -3,61 +3,75 @@ package kernel
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/bartdeboer/words"
 )
 
-// applyDeps wires dependencies into a node's adapter instance and records the graph edges.
-func (r *Registry) applyDeps(node *Node, meta *MetaHeader) error {
+func dependencyTag(sf reflect.StructField) string {
+	if tag := strings.TrimSpace(sf.Tag.Get("kernel")); tag != "" {
+		return tag
+	}
+	return strings.TrimSpace(sf.Tag.Get("core"))
+}
+
+func metaDependencies(meta *MetaHeader) map[string]DepRef {
 	if meta == nil {
 		return nil
 	}
+	return meta.Dependencies
+}
 
-	deps, err := resolvedDeps(node.Instance, meta)
+func normalizeDepKeys(deps map[string]DepRef) map[string]DepRef {
+	if deps == nil {
+		return nil
+	}
+
+	out := make(map[string]DepRef, len(deps))
+	for k, v := range deps {
+		out[words.ToCapWords(k)] = v
+	}
+	return out
+}
+
+func (n *Node) AssignDependencies() error {
+	if n == nil {
+		return fmt.Errorf("assign dependencies: nil node")
+	}
+	if n.reg == nil {
+		return fmt.Errorf("assign dependencies: node has no registry")
+	}
+
+	inferred, err := findStructDeps(n.Instance)
 	if err != nil {
 		return err
 	}
+
+	deps := mergeDeps(normalizeDepKeys(metaDependencies(n.AdapterMeta)), inferred)
+	deps = mergeDeps(normalizeDepKeys(metaDependencies(n.ItemMeta)), deps)
+
 	if len(deps) == 0 {
 		return nil
 	}
 
-	if err := r.resolveStructDeps(node, deps); err != nil {
-		return err
-	}
-	return nil
-}
-
-// resolvedDeps combines explicit config deps with inferred struct deps.
-// Config wins over inferred.
-func resolvedDeps(adapter Adapter, meta *MetaHeader) (map[string]DepRef, error) {
-	inferred, err := findStructDeps(adapter)
-	if err != nil {
-		return nil, err
-	}
-
-	var cfg map[string]DepRef
-	if meta != nil {
-		cfg = meta.Dependencies
-	}
-
-	return mergeDeps(cfg, inferred), nil
-}
-
-// resolveStructDeps initialises and assigns dependencies to exported
-// struct fields on the parent node's instance whose names match deps' keys.
-func (r *Registry) resolveStructDeps(parent *Node, deps map[string]DepRef) error {
-	v := reflect.ValueOf(parent.Instance)
+	v := reflect.ValueOf(n.Instance)
 	if v.Kind() != reflect.Ptr {
-		return fmt.Errorf("resolveStructDeps: target must be a pointer, got %T", parent.Instance)
+		return fmt.Errorf("assign dependencies: target must be a pointer, got %T", n.Instance)
 	}
 	v = v.Elem()
 	if v.Kind() != reflect.Struct {
-		return fmt.Errorf("resolveStructDeps: target must point to a struct, got %T", parent.Instance)
+		return fmt.Errorf("assign dependencies: target must point to a struct, got %T", n.Instance)
 	}
 
-	for mapName, ref := range deps {
-		fieldName := words.ToCapWords(mapName)
+	names := make([]string, 0, len(deps))
+	for name := range deps {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, fieldName := range names {
+		depRef := deps[fieldName]
 
 		field := v.FieldByName(fieldName)
 		if !field.IsValid() {
@@ -67,27 +81,28 @@ func (r *Registry) resolveStructDeps(parent *Node, deps map[string]DepRef) error
 			return fmt.Errorf("field %q is not settable", fieldName)
 		}
 
-		childArgs := append([]string(nil), ref.Args...)
-		if ref.Name != "" {
-			childArgs = append([]string{ref.Name}, childArgs...)
+		childArgs := append([]string(nil), depRef.Args...)
+		if depRef.Name != "" {
+			childArgs = append([]string{depRef.Name}, childArgs...)
 		}
 
-		child, err := r.constructWithContext(ref.Adapter, parent.ResolvedWorkDir, childArgs...)
+		child, err := n.reg.constructWithWorkDir(depRef.Adapter, n.ResolvedWorkDir, childArgs...)
 		if err != nil {
 			return fmt.Errorf("dependency %q: %w", fieldName, err)
 		}
 
 		depVal := reflect.ValueOf(child.Instance)
 		if !depVal.Type().AssignableTo(field.Type()) {
-			return fmt.Errorf("dependency %q (%s) not assignable to field %s (%s)",
-				fieldName, depVal.Type(), fieldName, field.Type())
+			return fmt.Errorf(
+				"dependency %q (%s) not assignable to field %s (%s)",
+				fieldName, depVal.Type(), fieldName, field.Type(),
+			)
 		}
 
-		Log().Debugf("assigned %s to %s %s\n",
-			depVal.Type(), fieldName, field.Type())
+		Log().Debugf("assigned %s to %s %s\n", depVal.Type(), fieldName, field.Type())
 
 		field.Set(depVal)
-		parent.Dependencies[fieldName] = child
+		n.Dependencies[fieldName] = child
 	}
 
 	return nil
@@ -108,7 +123,7 @@ func validateRequiredDeps(target any) error {
 		field := v.Field(i)
 		fieldType := t.Field(i)
 
-		tag := fieldType.Tag.Get("core")
+		tag := dependencyTag(fieldType)
 		if tag == "required" {
 			if field.Kind() == reflect.Interface || field.Kind() == reflect.Ptr {
 				if field.IsNil() {
@@ -126,8 +141,9 @@ func validateRequiredDeps(target any) error {
 	return nil
 }
 
-// findStructDeps inspects exported fields for `core` tags that specify an adapter id.
-// It returns a deps map keyed by *field name*.
+// findStructDeps inspects exported fields for `kernel` tags, falling back to `core`,
+// to determine dependency adapter ids.
+// It returns a deps map keyed by struct field name.
 func findStructDeps(target any) (map[string]DepRef, error) {
 	v := reflect.ValueOf(target)
 	if v.Kind() != reflect.Ptr || v.IsNil() {
@@ -144,12 +160,11 @@ func findStructDeps(target any) (map[string]DepRef, error) {
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 
-		// Only exported fields participate in dependency injection.
 		if sf.PkgPath != "" {
 			continue
 		}
 
-		tag := strings.TrimSpace(sf.Tag.Get("core"))
+		tag := dependencyTag(sf)
 		if tag == "" {
 			continue
 		}
@@ -160,10 +175,8 @@ func findStructDeps(target any) (map[string]DepRef, error) {
 
 		switch {
 		case len(parts) >= 2:
-			// Positional form: first token is the adapter key (even if a later token is "required").
 			adapterID = strings.TrimSpace(parts[0])
 		default:
-			// Single token form: either a flag (required) or an adapter key.
 			p := strings.TrimSpace(parts[0])
 			if !strings.EqualFold(p, "required") {
 				adapterID = p
@@ -186,11 +199,9 @@ func mergeDeps(config map[string]DepRef, inferred map[string]DepRef) map[string]
 	}
 	out := make(map[string]DepRef)
 
-	// Config wins over inferred dependencies.
 	for k, v := range config {
 		out[k] = v
 	}
-	// Fill in any gaps from inferred struct tags.
 	for k, v := range inferred {
 		if _, exists := out[k]; !exists {
 			out[k] = v
